@@ -175,10 +175,9 @@ describe('usageExportConfig', () => {
   })
 })
 
-// The allocation snapshot cron posts to the same destination and token as
-// finalized-usage export, so it demands the same two settings — but it can be
-// turned on while export itself stays off, and each flag alone must be enough
-// to require them.
+// The allocation snapshot covers closing periods through the finalized-usage
+// outbox, so it cannot run without that outbox being enabled. Destination
+// validation still happens first so a malformed endpoint names its own fault.
 describe('usageExportConfig when only the allocation snapshot is enabled', () => {
   const snapshotOnly = (overrides: Record<string, string> = {}) => ({
     USAGE_EXPORT_ENABLED: 'false',
@@ -193,23 +192,13 @@ describe('usageExportConfig when only the allocation snapshot is enabled', () =>
     expect(() => usageExportConfig(environment)).toThrow(expected)
   })
 
-  it('accepts a fully configured destination', () => {
-    expect(
+  it('refuses to start without finalized export', () => {
+    expect(() =>
       usageExportConfig(snapshotOnly({ USAGE_EXPORT_URL: 'https://commerce.test', USAGE_EXPORT_TOKEN: 'tok' })),
-    ).toEqual(
-      expect.objectContaining({
-        enabled: false,
-        allocationSnapshotEnabled: true,
-        url: 'https://commerce.test',
-        token: 'tok',
-      }),
-    )
+    ).toThrow(/USAGE_ALLOCATION_SNAPSHOT_ENABLED requires USAGE_EXPORT_ENABLED/)
   })
 
-  // The claim-visibility invariant exists only for the claim-based outbox
-  // export; the snapshot cron is a stateless full-replace push with no claim to
-  // double up, so its own timeout has nothing to violate.
-  it('does not enforce the export claim-visibility timeout window', () => {
+  it('rejects snapshot-only mode before applying export visibility rules', () => {
     expect(() =>
       usageExportConfig(
         snapshotOnly({
@@ -218,7 +207,7 @@ describe('usageExportConfig when only the allocation snapshot is enabled', () =>
           USAGE_EXPORT_TIMEOUT_MS: String(USAGE_EXPORT_VISIBILITY_TIMEOUT_MS),
         }),
       ),
-    ).not.toThrow()
+    ).toThrow(/USAGE_ALLOCATION_SNAPSHOT_ENABLED requires USAGE_EXPORT_ENABLED/)
   })
 })
 

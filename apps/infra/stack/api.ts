@@ -346,6 +346,14 @@ const api = new sst.aws.Service('Api', {
       // shared secret would crash-loop on deploy instead of simply not
       // exporting yet. Setting the secret is what turns delivery on.
       USAGE_EXPORT_ENABLED: usageExportToken.value.apply((token: string) => (token.trim() ? 'true' : 'false')),
+      // The same destination and credential carry the five-minute full
+      // snapshot of allocations not yet acknowledged as finalized. Both flags
+      // move together because the finalized outbox bridges close-to-ACK races.
+      // Commerce's v3 chunk receiver must deploy first; this producer must be
+      // disabled or rolled back before Commerce drops that route.
+      USAGE_ALLOCATION_SNAPSHOT_ENABLED: usageExportToken.value.apply((token: string) =>
+        token.trim() ? 'true' : 'false',
+      ),
     }),
   },
 })

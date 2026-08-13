@@ -11,16 +11,14 @@ import { createHash } from 'node:crypto'
  */
 export const USAGE_EXPORT_SCHEMA_VERSION = 1
 
-/**
- * Quantities are allocation counts (vCPU, GiB), never money. This ceiling is a
- * boundary check, not a product limit: a conservative round number below 2^53,
- * where a double stops representing every integer exactly and the encoding
- * below would no longer round-trip the value it was given.
- */
-const MAX_QUANTITY = 1e15
+/** Commerce's per-metric magnitude ceiling for usage events and snapshots. */
+const MAX_QUANTITY = 1_000_000
 
-/** Digits kept when encoding a quantity. Trailing zeros are stripped. */
-const QUANTITY_DECIMALS = 12
+/** Matches Commerce's identity ceiling for usage events and snapshots. */
+const MAX_IDENTITY_LENGTH = 200
+
+/** Commerce stores usage quantities on a numeric(*, 6) grid. */
+const QUANTITY_DECIMALS = 6
 
 /**
  * A closed usage period, in the shape both `BoxUsagePeriod` (once its `endAt`
@@ -98,9 +96,8 @@ function sha256(value: string): string {
 /**
  * Canonical decimal encoding for a resource quantity.
  *
- * Never `String(value)`: that yields exponent notation for small magnitudes
- * ("1e-7"), and two spellings of one quantity would be two event identities for
- * one usage fact — which is how the same period gets billed twice.
+ * Commerce accepts only plain decimals on its six-place storage grid. Fixed
+ * encoding also gives each accepted quantity one spelling for event identity.
  *
  * Exported so other usage-quantity encodings (e.g. the open-allocation
  * snapshot) share this exact rule rather than growing their own.
@@ -113,16 +110,14 @@ export function quantityString(value: number, field: string): string {
     throw new InvalidUsagePeriodError(`${field} must not be negative`)
   }
   if (value > MAX_QUANTITY) {
-    throw new InvalidUsagePeriodError(`${field} exceeds the maximum encodable quantity`)
+    throw new InvalidUsagePeriodError(`${field} exceeds the maximum Commerce quantity of ${MAX_QUANTITY}`)
+  }
+  const resolution = 10 ** QUANTITY_DECIMALS
+  if (Math.round(value * resolution) / resolution !== value) {
+    throw new InvalidUsagePeriodError(`${field} must have at most ${QUANTITY_DECIMALS} fractional digits`)
   }
   const fixed = value.toFixed(QUANTITY_DECIMALS)
   const encoded = fixed.includes('.') ? fixed.replace(/0+$/, '').replace(/\.$/, '') : fixed
-  // Below 1e-12 the encoding rounds to "0", which would both drop the usage and
-  // hand the period the same identity as a genuinely zero one. Refuse rather
-  // than export a quantity that is not the quantity it was given.
-  if (value > 0 && Number(encoded) === 0) {
-    throw new InvalidUsagePeriodError(`${field} is too small to encode without rounding it away`)
-  }
   return encoded
 }
 
@@ -134,8 +129,8 @@ export function timestampString(value: Date, field: string): string {
 }
 
 export function identityString(value: string, field: string): string {
-  if (typeof value !== 'string' || !value.trim()) {
-    throw new InvalidUsagePeriodError(`${field} must be a non-empty string`)
+  if (typeof value !== 'string' || !value.trim() || value.length > MAX_IDENTITY_LENGTH) {
+    throw new InvalidUsagePeriodError(`${field} must be a non-empty string of at most ${MAX_IDENTITY_LENGTH} characters`)
   }
   return value
 }

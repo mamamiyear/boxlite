@@ -59,9 +59,16 @@ export class UsageExportOutboxService {
     }
 
     const closed = periods.filter((period) => period.endAt !== null)
-    const billable = closed.filter((period) => period.organizationId !== BOX_WARM_POOL_UNASSIGNED_ORGANIZATION)
-    if (billable.length < closed.length) {
-      this.logger.debug(`Skipped ${closed.length - billable.length} warm-pool usage periods`)
+    // Equal endpoints describe no elapsed usage. Exporting that no-op is worse
+    // than merely redundant: an immediately reopened successor can share its
+    // startAt, so the zero event would suppress the live interval downstream.
+    const elapsed = closed.filter((period) => period.endAt?.getTime() !== period.startAt.getTime())
+    if (elapsed.length < closed.length) {
+      this.logger.debug(`Skipped ${closed.length - elapsed.length} zero-duration usage periods`)
+    }
+    const billable = elapsed.filter((period) => period.organizationId !== BOX_WARM_POOL_UNASSIGNED_ORGANIZATION)
+    if (billable.length < elapsed.length) {
+      this.logger.debug(`Skipped ${elapsed.length - billable.length} warm-pool usage periods`)
     }
     if (billable.length === 0) {
       return 0

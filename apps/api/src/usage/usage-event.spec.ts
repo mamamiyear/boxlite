@@ -100,14 +100,13 @@ describe('toUsageEventDto', () => {
     })
   })
 
-  // String(1e-7) is "1e-7". Two spellings of one quantity would be two
-  // identities for one usage fact, so the encoding must never reach exponent
-  // notation.
+  // The wire contract uses plain fixed-point quantities on Commerce's
+  // six-decimal storage grid.
   it.each<[number, string]>([
     [0, '0'],
     [2, '2'],
     [0.5, '0.5'],
-    [0.0000001, '0.0000001'],
+    [0.000001, '0.000001'],
     [1.25, '1.25'],
   ])('encodes quantity %p as %p', (cpu, expected) => {
     expect(toUsageEventDto(period({ cpu })).cpu).toBe(expected)
@@ -145,26 +144,26 @@ describe('usage period validation', () => {
     ['a negative quantity', { disk: -1 }],
     ['a blank organizationId', { organizationId: '  ' }],
     ['a blank boxId', { boxId: '' }],
+    ['a boxId longer than Commerce accepts', { boxId: 'b'.repeat(201) }],
     ['an invalid startAt', { startAt: new Date('nonsense') }],
     ['an end before the start', { endAt: new Date('2026-07-01T00:00:00.000Z') }],
-    ['a quantity past the encodable ceiling', { mem: 1e16 }],
-    // toFixed(12) turns this into "0", which would both drop the usage and give
-    // the period the identity of a genuinely zero one.
-    ['a quantity that rounds away to zero', { cpu: 1e-13 }],
+    ['a quantity past the Commerce ceiling', { mem: 1_000_001 }],
+    ['a quantity finer than the Commerce storage grid', { cpu: 0.0000001 }],
   ])('rejects %s', (_case, override) => {
     expect(() => usageEventKey(period(override))).toThrow(InvalidUsagePeriodError)
   })
 
-  it('accepts a quantity at the ceiling', () => {
-    expect(() => usageEventKey(period({ mem: 1e15 }))).not.toThrow()
+  it('accepts quantities at the Commerce magnitude and resolution boundaries', () => {
+    expect(() => usageEventKey(period({ mem: 1_000_000 }))).not.toThrow()
+    expect(toUsageEventDto(period({ cpu: 0.000001 })).cpu).toBe('0.000001')
   })
 
-  it('accepts the smallest quantity the encoding can still carry', () => {
-    expect(toUsageEventDto(period({ cpu: 1e-12 })).cpu).toBe('0.000000000001')
+  it('accepts an identity at the Commerce boundary', () => {
+    expect(() => usageEventKey(period({ region: 'r'.repeat(200) }))).not.toThrow()
   })
 
-  // Zero is a real quantity — a stopped box holds disk but no CPU — so the
-  // underflow guard must not swallow it.
+  // Zero is a real quantity — a stopped box holds disk but no CPU — so it must
+  // remain distinct from invalid sub-grid values.
   it('still encodes a genuine zero', () => {
     expect(toUsageEventDto(period({ cpu: 0 })).cpu).toBe('0')
   })

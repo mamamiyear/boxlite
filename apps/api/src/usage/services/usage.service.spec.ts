@@ -61,6 +61,7 @@ const makeService = (stored: BoxUsagePeriod[] = []) => {
     ),
     find: jest.fn().mockResolvedValue([]),
     save: jest.fn().mockImplementation(async (period) => period),
+    delete: jest.fn().mockResolvedValue({ affected: 1 }),
     manager: {
       transaction: jest.fn(async (callback) => callback(transactionalEntityManager)),
     },
@@ -89,6 +90,7 @@ const makeService = (stored: BoxUsagePeriod[] = []) => {
     usagePeriodRepository,
     redisLockProvider,
     usageExportOutboxService,
+    boxRepository,
     lease,
     transactionalEntityManager,
   }
@@ -96,8 +98,21 @@ const makeService = (stored: BoxUsagePeriod[] = []) => {
 
 const OTHER_BOX_ID = 'box-2'
 
-const openPeriod = (cpu = box.cpu, boxId = box.id) => ({ boxId, cpu, endAt: null }) as unknown as BoxUsagePeriod
-const closedPeriod = (cpu = box.cpu, boxId = box.id) => ({ boxId, cpu, endAt: new Date() }) as unknown as BoxUsagePeriod
+const openPeriod = (cpu = box.cpu, boxId = box.id) =>
+  Object.assign(new BoxUsagePeriod(), {
+    id: `period-${boxId}`,
+    boxId,
+    organizationId: box.organizationId,
+    region: box.region,
+    startAt: new Date(Date.now() - 1_000),
+    endAt: null,
+    cpu,
+    gpu: box.gpu,
+    mem: box.mem,
+    disk: box.disk,
+  })
+const closedPeriod = (cpu = box.cpu, boxId = box.id) =>
+  Object.assign(openPeriod(cpu, boxId), { endAt: new Date() })
 
 // Every handler below is reached only through an @OnEvent subscription; calling
 // them directly proves the body, not that anything ever calls it.
@@ -156,14 +171,70 @@ describe('UsageService.handleBoxStateUpdate', () => {
 
   it('closes the previous period before opening a new one when the box starts', async () => {
     const stale = openPeriod()
-    const { service, usagePeriodRepository } = makeService([stale])
+    const { service, transactionalEntityManager } = makeService([stale])
 
     await service.handleBoxStateUpdate(event(BoxState.STARTED))
 
-    const [closed, opened] = usagePeriodRepository.save.mock.calls.map(([period]) => period)
+    const [closed, opened] = transactionalEntityManager.save.mock.calls.map(([period]) => period)
     expect(closed).toBe(stale)
     expect(stale.endAt).toBeInstanceOf(Date)
     expect(opened).toEqual(expect.objectContaining({ cpu: 2, endAt: null }))
+  })
+
+  it('atomically replaces a zero-duration predecessor instead of exporting its duplicate identity', async () => {
+    const instant = new Date('2026-08-01T00:00:00.000Z')
+    jest.useFakeTimers().setSystemTime(instant)
+    const stale = Object.assign(openPeriod(), { id: 'period-1', startAt: instant })
+    const { service, usagePeriodRepository, transactionalEntityManager } = makeService([stale])
+
+    try {
+      await service.handleBoxStateUpdate(event(BoxState.STARTED))
+    } finally {
+      jest.useRealTimers()
+    }
+
+    expect(usagePeriodRepository.manager.transaction).toHaveBeenCalledTimes(1)
+    expect(transactionalEntityManager.delete).toHaveBeenCalledWith(BoxUsagePeriod, stale.id)
+    expect(transactionalEntityManager.save).toHaveBeenCalledTimes(1)
+    expect(transactionalEntityManager.save).toHaveBeenCalledWith(
+      expect.objectContaining({ boxId: box.id, startAt: instant, endAt: null }),
+    )
+    expect(usagePeriodRepository.save).not.toHaveBeenCalled()
+  })
+
+  it('deletes a zero-duration close-only period because it contains no usage fact', async () => {
+    const instant = new Date('2026-08-01T00:00:00.000Z')
+    jest.useFakeTimers().setSystemTime(instant)
+    const open = Object.assign(openPeriod(), { id: 'period-1', startAt: instant })
+    const { service, usagePeriodRepository } = makeService([open])
+
+    try {
+      await service.handleBoxStateUpdate(event(BoxState.DESTROYED))
+    } finally {
+      jest.useRealTimers()
+    }
+
+    expect(usagePeriodRepository.delete).toHaveBeenCalledWith(open.id)
+    expect(usagePeriodRepository.save).not.toHaveBeenCalled()
+  })
+
+  it('keeps a clock-rollback close for blocked diagnostics instead of treating it as zero duration', async () => {
+    const now = new Date('2026-08-01T00:00:00.000Z')
+    jest.useFakeTimers().setSystemTime(now)
+    const open = Object.assign(openPeriod(), {
+      id: 'period-1',
+      startAt: new Date(now.getTime() + 1_000),
+    })
+    const { service, usagePeriodRepository } = makeService([open])
+
+    try {
+      await service.handleBoxStateUpdate(event(BoxState.DESTROYED))
+    } finally {
+      jest.useRealTimers()
+    }
+
+    expect(usagePeriodRepository.delete).not.toHaveBeenCalled()
+    expect(usagePeriodRepository.save).toHaveBeenCalledWith(expect.objectContaining({ endAt: now }))
   })
 
   it('never closes a period belonging to a different box', async () => {
@@ -200,11 +271,11 @@ describe('UsageService.handleBoxStateUpdate', () => {
 
   it('closes the open period and reopens it disk-only when the box stops', async () => {
     const open = openPeriod()
-    const { service, usagePeriodRepository } = makeService([open])
+    const { service, transactionalEntityManager } = makeService([open])
 
     await service.handleBoxStateUpdate(event(BoxState.STOPPING))
 
-    const [closed, reopened] = usagePeriodRepository.save.mock.calls.map(([period]) => period)
+    const [closed, reopened] = transactionalEntityManager.save.mock.calls.map(([period]) => period)
     expect(closed).toBe(open)
     expect(closed.endAt).toBeInstanceOf(Date)
     // a stopped box keeps paying for disk, but not for cpu/gpu/mem
@@ -224,11 +295,11 @@ describe('UsageService.handleBoxStateUpdate', () => {
 
   it('closes a still-billing period when the box lands in STOPPED without passing through STOPPING', async () => {
     const open = openPeriod()
-    const { service, usagePeriodRepository } = makeService([open])
+    const { service, transactionalEntityManager } = makeService([open])
 
     await service.handleBoxStateUpdate(event(BoxState.STOPPED))
 
-    const [closed, reopened] = usagePeriodRepository.save.mock.calls.map(([period]) => period)
+    const [closed, reopened] = transactionalEntityManager.save.mock.calls.map(([period]) => period)
     expect(closed).toBe(open)
     expect(closed.endAt).toBeInstanceOf(Date)
     expect(reopened).toEqual(expect.objectContaining({ cpu: 0, gpu: 0, mem: 0, disk: 10, endAt: null }))
@@ -288,19 +359,20 @@ describe('UsageService.handleBoxStateUpdate', () => {
 
   it('does not reopen a period after lease ownership is lost while closing it', async () => {
     const open = openPeriod()
-    const { service, usagePeriodRepository, lease } = makeService([open])
+    const { service, usagePeriodRepository, transactionalEntityManager, lease } = makeService([open])
     const ownershipError = new Error('ownership was lost')
     const controller = new AbortController()
     lease.signal = controller.signal
-    usagePeriodRepository.save.mockImplementationOnce(async (period) => {
+    transactionalEntityManager.save.mockImplementationOnce(async (period) => {
       controller.abort(ownershipError)
       return period
     })
 
     await expect(service.handleBoxStateUpdate(event(BoxState.STARTED))).rejects.toBe(ownershipError)
 
-    expect(usagePeriodRepository.save).toHaveBeenCalledTimes(1)
-    expect(usagePeriodRepository.save).toHaveBeenCalledWith(open)
+    expect(transactionalEntityManager.save).toHaveBeenCalledTimes(1)
+    expect(transactionalEntityManager.save).toHaveBeenCalledWith(open)
+    expect(usagePeriodRepository.save).not.toHaveBeenCalled()
     expect(lease.release).toHaveBeenCalledTimes(1)
   })
 })
@@ -336,6 +408,45 @@ describe('UsageService.handleBoxDesiredStateUpdate', () => {
     )
 
     expect(lease.release).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('UsageService zero-duration cron transitions', () => {
+  const instant = new Date('2026-08-01T00:00:00.000Z')
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  it('rollover deletes a zero-duration predecessor while opening its successor atomically', async () => {
+    jest.useFakeTimers().setSystemTime(instant)
+    const stale = Object.assign(openPeriod(), { id: 'period-1', startAt: instant })
+    const { service, usagePeriodRepository, transactionalEntityManager, boxRepository } = makeService([stale])
+    usagePeriodRepository.find.mockResolvedValue([stale])
+    boxRepository.findOne.mockResolvedValue({ ...box, state: BoxState.STARTED })
+
+    await service.closeAndReopenUsagePeriods()
+
+    expect(transactionalEntityManager.delete).toHaveBeenCalledWith(BoxUsagePeriod, stale.id)
+    expect(transactionalEntityManager.save).toHaveBeenCalledTimes(1)
+    expect(transactionalEntityManager.save).toHaveBeenCalledWith(
+      expect.objectContaining({ boxId: box.id, startAt: instant, endAt: null }),
+    )
+  })
+
+  it('drift repair deletes a zero-duration predecessor while opening its successor atomically', async () => {
+    jest.useFakeTimers().setSystemTime(instant)
+    const stale = Object.assign(openPeriod(0), { id: 'period-1', startAt: instant })
+    const { service, transactionalEntityManager, boxRepository } = makeService([stale])
+    boxRepository.findOne.mockResolvedValue({ ...box, state: BoxState.STARTED })
+
+    await (service as any).repairDrift({ box_id: box.id })
+
+    expect(transactionalEntityManager.delete).toHaveBeenCalledWith(BoxUsagePeriod, stale.id)
+    expect(transactionalEntityManager.save).toHaveBeenCalledTimes(1)
+    expect(transactionalEntityManager.save).toHaveBeenCalledWith(
+      expect.objectContaining({ boxId: box.id, startAt: instant, endAt: null }),
+    )
   })
 })
 

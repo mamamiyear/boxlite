@@ -3,21 +3,19 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
-import { identityString, quantityString, timestampString } from './usage-event'
+import { identityString, InvalidUsagePeriodError, quantityString, timestampString } from './usage-event'
 
 /**
- * A still-open usage period, in the shape `BoxUsagePeriod` has before its
- * `endAt` is known.
- *
- * Unlike `FinalizedUsagePeriod`, there is no `endAt` here at all: an open
- * period has no end yet, and giving the type an optional field would let a
- * closed period slip in by omission instead of by the caller's choice.
+ * One allocation that Commerce has not yet acknowledged as finalized.
+ * `endAt` is absent for a live period and is the real close time while its
+ * finalized event remains undelivered in the transactional outbox.
  */
 export interface OpenAllocation {
   organizationId: string
   boxId: string
   region: string
   startAt: Date
+  endAt?: Date | null
   cpu: number
   gpu: number
   mem: number
@@ -25,17 +23,18 @@ export interface OpenAllocation {
 }
 
 /**
- * One open allocation, exactly as it crosses the wire in a snapshot push.
+ * One allocation, exactly as it crosses the wire in a snapshot push.
  *
- * No `eventKey`: unlike a finalized usage event, a snapshot row has no
- * standalone identity to deliver at-least-once — the whole push is a single
- * replace-all fact, identified by `asOf` on the envelope that carries these.
+ * No `eventKey`: the snapshot is a replace-all observation, while
+ * organizationId+boxId+startAt is the interval identity Commerce uses to
+ * reconcile an optional closing row with its finalized event.
  */
 export interface OpenAllocationDto {
   organizationId: string
   boxId: string
   region: string
   startAt: string
+  endAt?: string
   cpu: string
   gpu: string
   mem: string
@@ -43,14 +42,13 @@ export interface OpenAllocationDto {
 }
 
 /**
- * Builds the exact bytes sent to Commerce for one open allocation.
+ * Builds the exact bytes sent to Commerce for one unfinalized allocation.
  *
- * Reuses `usage-event.ts`'s field encoders so an open allocation and a
- * finalized one describe organizationId/boxId/region/quantities identically —
- * the two payloads differ only in which interval fields they carry.
+ * Reuses `usage-event.ts`'s field encoders so snapshot and finalized forms
+ * describe organizationId/boxId/region/quantities identically.
  */
 export function toOpenAllocationDto(allocation: OpenAllocation): OpenAllocationDto {
-  return {
+  const dto: OpenAllocationDto = {
     organizationId: identityString(allocation.organizationId, 'organizationId'),
     boxId: identityString(allocation.boxId, 'boxId'),
     region: identityString(allocation.region, 'region'),
@@ -60,4 +58,14 @@ export function toOpenAllocationDto(allocation: OpenAllocation): OpenAllocationD
     mem: quantityString(allocation.mem, 'mem'),
     disk: quantityString(allocation.disk, 'disk'),
   }
+
+  if (allocation.endAt == null) {
+    return dto
+  }
+
+  const endAt = timestampString(allocation.endAt, 'endAt')
+  if (allocation.endAt < allocation.startAt) {
+    throw new InvalidUsagePeriodError('a closing allocation must not end before it starts')
+  }
+  return { ...dto, endAt }
 }

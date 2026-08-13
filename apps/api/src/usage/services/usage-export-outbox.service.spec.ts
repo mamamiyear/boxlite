@@ -129,6 +129,15 @@ describe('UsageExportOutboxService.enqueue', () => {
     expect(inserted).toHaveLength(0)
   })
 
+  it('does not export a zero-duration period as a finalized usage fact', async () => {
+    const { service } = makeService()
+    const { entityManager, inserted } = makeEntityManager()
+    const instant = new Date('2026-08-01T00:00:00.000Z')
+
+    await expect(service.enqueue(entityManager, [period({ startAt: instant, endAt: instant })])).resolves.toBe(0)
+    expect(inserted).toHaveLength(0)
+  })
+
   // Throwing would abort the caller's archive transaction, which covers every
   // closed period in one batch ordered by startAt — so one unparseable row
   // would sort early, sit in every batch, and wedge archiving forever.

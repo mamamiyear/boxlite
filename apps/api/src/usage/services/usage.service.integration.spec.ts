@@ -638,15 +638,16 @@ describeIfDatabase('UsageService (integration, real Postgres + Redis)', () => {
       expect(await outboxes.find()).toHaveLength(1)
     })
 
-    // Two zero-duration periods for one box hash to the same key, so they reach
-    // a single INSERT as duplicate rows. Nothing in the service de-duplicates
-    // them any more — this pins that ON CONFLICT DO NOTHING tolerates a repeat
-    // inside one statement, which is the behaviour that replaced it.
+    // Two copies of one positive-duration usage fact reach a single INSERT as
+    // duplicate rows. Nothing in the service de-duplicates them in memory —
+    // this pins that ON CONFLICT DO NOTHING tolerates a repeat inside one
+    // statement.
     it('collapses periods that share an event key inside one insert', async () => {
-      const instant = new Date(Date.now() - DAY_MS)
-      const first = await openPeriod({ startAt: instant, endAt: instant })
+      const startAt = new Date(Date.now() - 2 * DAY_MS)
+      const endAt = new Date(Date.now() - DAY_MS)
+      const first = await openPeriod({ startAt, endAt })
       await periods.delete({ id: first.id })
-      const second = await openPeriod({ startAt: instant, endAt: instant })
+      const second = await openPeriod({ startAt, endAt })
 
       await expect(outboxService(true).enqueue(dataSource.manager, [first, second])).resolves.toBe(1)
 

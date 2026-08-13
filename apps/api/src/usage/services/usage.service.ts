@@ -122,9 +122,7 @@ export class UsageService implements TrackableJobExecutions, OnApplicationShutdo
       signal.throwIfAborted()
       switch (event.newState) {
         case BoxState.STARTED: {
-          await this.closeUsagePeriod(event.box.id)
-          signal.throwIfAborted()
-          await this.openUsagePeriodFor(event.box, event.newState)
+          await this.replaceUsagePeriodFor(event.box, event.newState, signal)
           break
         }
         // Billing stops charging compute the moment a stop is requested, while
@@ -133,9 +131,7 @@ export class UsageService implements TrackableJobExecutions, OnApplicationShutdo
         // answer different questions; do not "reconcile" them without a pricing
         // decision.
         case BoxState.STOPPING:
-          await this.closeUsagePeriod(event.box.id)
-          signal.throwIfAborted()
-          await this.openUsagePeriodFor(event.box, event.newState)
+          await this.replaceUsagePeriodFor(event.box, event.newState, signal)
           break
         // Safeguards if STOPPING state is skipped
         case BoxState.STOPPED: {
@@ -148,9 +144,7 @@ export class UsageService implements TrackableJobExecutions, OnApplicationShutdo
           })
           signal.throwIfAborted()
           if (cpuUsagePeriod) {
-            await this.closeUsagePeriod(event.box.id)
-            signal.throwIfAborted()
-            await this.openUsagePeriodFor(event.box, event.newState)
+            await this.replaceUsagePeriodFor(event.box, event.newState, signal)
           }
           break
         }
@@ -166,11 +160,13 @@ export class UsageService implements TrackableJobExecutions, OnApplicationShutdo
   }
 
   /**
-   * Opens the period the box's current state calls for. A box that bills nothing
-   * (terminal) or whose state is still in flight gets none — the caller has
-   * already closed whatever was open.
+   * Replaces an open period with the shape the new box state calls for.
+   * Closing and opening share one timestamp and transaction, so a snapshot sees
+   * either side of the transition, never a transient gap. If the old period
+   * began in that same millisecond it has no elapsed usage; deleting it avoids
+   * giving it the successor's interval identity.
    */
-  private async openUsagePeriodFor(box: Box, state: BoxState) {
+  private async replaceUsagePeriodFor(box: Box, state: BoxState, signal: AbortSignal) {
     // The event's newState is the authority on where the box landed; the entity
     // it carries is a snapshot, and a synthetic transition may have been built
     // with a state of its own (see the warm-pool claim in box.service.ts).
@@ -178,17 +174,34 @@ export class UsageService implements TrackableJobExecutions, OnApplicationShutdo
     if (expected === null) {
       return
     }
-    await this.createUsagePeriod(box, expected)
+    const open = await this.boxUsagePeriodRepository.findOne({
+      where: { boxId: box.id, endAt: IsNull() },
+    })
+    signal.throwIfAborted()
+
+    if (!open) {
+      await this.createUsagePeriod(box, expected)
+      return
+    }
+
+    const transitionAt = new Date()
+    await this.boxUsagePeriodRepository.manager.transaction(async (transactionalEntityManager) => {
+      await this.closeOrDiscardUsagePeriod(open, transitionAt, transactionalEntityManager)
+      signal.throwIfAborted()
+      await this.createUsagePeriod(box, expected, transactionalEntityManager, transitionAt)
+      signal.throwIfAborted()
+    })
   }
 
   private async createUsagePeriod(
     box: Pick<Box, 'id' | 'organizationId' | 'region'>,
     shape: UsagePeriodShape,
     entityManager?: EntityManager,
+    startAt = new Date(),
   ) {
     const usagePeriod = new BoxUsagePeriod()
     usagePeriod.boxId = box.id
-    usagePeriod.startAt = new Date()
+    usagePeriod.startAt = startAt
     usagePeriod.endAt = null
     usagePeriod.cpu = shape.cpu
     usagePeriod.gpu = shape.gpu
@@ -209,9 +222,27 @@ export class UsageService implements TrackableJobExecutions, OnApplicationShutdo
     })
 
     if (lastUsagePeriod) {
-      lastUsagePeriod.endAt = new Date()
-      await this.boxUsagePeriodRepository.save(lastUsagePeriod)
+      await this.closeOrDiscardUsagePeriod(lastUsagePeriod, new Date())
     }
+  }
+
+  /** A zero-duration row is not a usage fact; negative duration remains diagnostic data. */
+  private async closeOrDiscardUsagePeriod(
+    usagePeriod: BoxUsagePeriod,
+    endAt: Date,
+    entityManager?: EntityManager,
+  ): Promise<void> {
+    if (endAt.getTime() === usagePeriod.startAt.getTime()) {
+      if (entityManager) {
+        await entityManager.delete(BoxUsagePeriod, usagePeriod.id)
+      } else {
+        await this.boxUsagePeriodRepository.delete(usagePeriod.id)
+      }
+      return
+    }
+
+    usagePeriod.endAt = endAt
+    await (entityManager ? entityManager.save(usagePeriod) : this.boxUsagePeriodRepository.save(usagePeriod))
   }
 
   @Cron(CronExpression.EVERY_MINUTE, { name: 'close-and-reopen-usage-periods' })
@@ -258,8 +289,7 @@ export class UsageService implements TrackableJobExecutions, OnApplicationShutdo
             boxSignal.throwIfAborted()
             // Close usage period
             const closeTime = new Date()
-            usagePeriod.endAt = closeTime
-            await transactionalEntityManager.save(usagePeriod)
+            await this.closeOrDiscardUsagePeriod(usagePeriod, closeTime, transactionalEntityManager)
 
             // Roll over with the resources the box calls for *now*, not the ones
             // the closing period happened to carry. Copying the old figures kept
@@ -453,10 +483,13 @@ export class UsageService implements TrackableJobExecutions, OnApplicationShutdo
       await this.boxUsagePeriodRepository.manager.transaction(async (transactionalEntityManager) => {
         signal.throwIfAborted()
         if (open) {
-          open.endAt = new Date()
-          await transactionalEntityManager.save(open)
+          const transitionAt = new Date()
+          await this.closeOrDiscardUsagePeriod(open, transitionAt, transactionalEntityManager)
+          signal.throwIfAborted()
+          await this.createUsagePeriod(box, expected, transactionalEntityManager, transitionAt)
+          signal.throwIfAborted()
+          return
         }
-        signal.throwIfAborted()
         await this.createUsagePeriod(box, expected, transactionalEntityManager)
         signal.throwIfAborted()
       })

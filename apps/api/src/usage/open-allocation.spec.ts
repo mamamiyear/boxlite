@@ -32,13 +32,27 @@ describe('toOpenAllocationDto', () => {
     })
   })
 
-  // String(1e-7) is "1e-7" — the same underflow risk toUsageEventDto guards
-  // against applies here, since both share the same quantityString encoder.
+  it('carries the real endAt for an allocation awaiting finalized delivery', () => {
+    const closing = {
+      ...allocation(),
+      endAt: new Date('2026-08-01T01:00:00.000Z'),
+    }
+
+    expect(toOpenAllocationDto(closing)).toEqual(
+      expect.objectContaining({
+        startAt: '2026-08-01T00:00:00.000Z',
+        endAt: '2026-08-01T01:00:00.000Z',
+      }),
+    )
+  })
+
+  // Snapshot quantities use the same fixed-point encoding and six-decimal
+  // storage grid as finalized usage events.
   it.each<[number, string]>([
     [0, '0'],
     [2, '2'],
     [0.5, '0.5'],
-    [0.0000001, '0.0000001'],
+    [0.000001, '0.000001'],
     [1.25, '1.25'],
   ])('encodes quantity %p as %p', (cpu, expected) => {
     expect(toOpenAllocationDto(allocation({ cpu })).cpu).toBe(expected)
@@ -50,15 +64,21 @@ describe('toOpenAllocationDto', () => {
     ['a negative quantity', { disk: -1 }],
     ['a blank organizationId', { organizationId: '  ' }],
     ['a blank boxId', { boxId: '' }],
+    ['a region longer than Commerce accepts', { region: 'r'.repeat(201) }],
     ['an invalid startAt', { startAt: new Date('nonsense') }],
-    ['a quantity past the encodable ceiling', { mem: 1e16 }],
-    ['a quantity that rounds away to zero', { cpu: 1e-13 }],
+    ['a quantity past the Commerce ceiling', { mem: 1_000_001 }],
+    ['a quantity finer than the Commerce storage grid', { cpu: 0.0000001 }],
   ])('rejects %s', (_case, override) => {
     expect(() => toOpenAllocationDto(allocation(override))).toThrow(InvalidUsagePeriodError)
   })
 
+  it('accepts quantities at the Commerce magnitude and resolution boundaries', () => {
+    expect(toOpenAllocationDto(allocation({ mem: 1_000_000 })).mem).toBe('1000000')
+    expect(toOpenAllocationDto(allocation({ cpu: 0.000001 })).cpu).toBe('0.000001')
+  })
+
   // Zero is a real quantity — a box holding disk but with cpu momentarily
-  // idle-billed at 0 — so the underflow guard must not swallow it.
+  // idle-billed at 0 — so it must remain distinct from invalid sub-grid values.
   it('still encodes a genuine zero', () => {
     expect(toOpenAllocationDto(allocation({ cpu: 0 })).cpu).toBe('0')
   })

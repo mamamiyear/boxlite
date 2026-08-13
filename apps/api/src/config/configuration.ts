@@ -79,17 +79,20 @@ function requiredHttpUrl(value: string, name: string): string {
 }
 
 /**
- * Export of finalized usage periods, and snapshots of still-open ones, to the
- * Commerce service. Kept separate from billingApiUrl on purpose, for the same
- * reason requirePaymentMethod is: pointing the dashboard at a billing service
- * and shipping usage to it are different decisions. `enabled` gates the outbox
- * write as well as delivery, so a stage that never exports accumulates no rows.
+ * Export of finalized usage periods, and snapshots of every allocation not yet
+ * acknowledged as finalized, to the Commerce service. Kept separate from
+ * billingApiUrl on purpose, for the same reason requirePaymentMethod is:
+ * pointing the dashboard at a billing service and shipping usage to it are
+ * different decisions. `enabled` gates the outbox write as well as delivery,
+ * so a stage that never exports accumulates no rows.
  *
- * The allocation snapshot cron posts to the same destination with the same
- * token (it is the same Commerce service, just a different internal route), so
- * it shares this URL/token pair rather than getting its own — but it can be
- * turned on independently of finalized-usage export, so either flag alone must
- * be enough to require them.
+ * The allocation snapshot cron posts v3 chunks to the same destination's
+ * `/internal/allocation-snapshot-chunks` route with the same token, so it shares
+ * this URL/token pair rather than getting its own. Snapshot mode also requires
+ * finalized export: the transactional outbox is what keeps a closing allocation
+ * visible until Commerce acknowledges its finalized event. Deploy that Commerce
+ * receiver before enabling this producer; disable or roll back this producer
+ * before rolling Commerce back past the v3 route.
  *
  * Exported so its rules can be tested directly rather than through an import
  * whose side effect is reading the process environment.
@@ -133,6 +136,12 @@ export function usageExportConfig(env: NodeJS.ProcessEnv = process.env) {
   if (!token) {
     throw new Error(`USAGE_EXPORT_TOKEN is required when ${enabledBy} is true`)
   }
+  const url = requiredHttpUrl(rawUrl, 'USAGE_EXPORT_URL')
+  if (allocationSnapshotEnabled && !enabled) {
+    throw new Error(
+      'USAGE_ALLOCATION_SNAPSHOT_ENABLED requires USAGE_EXPORT_ENABLED so closing allocations remain visible until Commerce acknowledges finalized delivery',
+    )
+  }
   // A request still in flight when its rows become claimable again is delivered
   // twice — harmless, since the receiver deduplicates, but it doubles the load
   // exactly when the receiver is already too slow to answer in time. Only the
@@ -144,7 +153,7 @@ export function usageExportConfig(env: NodeJS.ProcessEnv = process.env) {
     )
   }
 
-  return { ...settings, url: requiredHttpUrl(rawUrl, 'USAGE_EXPORT_URL') }
+  return { ...settings, url }
 }
 
 // The object-store key namespace migration archives land in by default, inside
