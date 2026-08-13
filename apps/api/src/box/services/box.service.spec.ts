@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
-import { BadRequestException, ForbiddenException } from '@nestjs/common'
+import { BadRequestException, ForbiddenException, HttpException } from '@nestjs/common'
 import { BoxService } from './box.service'
 import { BoxState } from '../enums/box-state.enum'
 import { BoxDesiredState } from '../enums/box-desired-state.enum'
@@ -53,6 +53,7 @@ function makeService() {
     noop, // boxActivityService
     noop, // jobRepository
     noop, // jobService
+    noop, // commerceAdmission
   )
   return { service, boxRepository, eventEmitter, organizationService, organizationUsageService }
 }
@@ -96,6 +97,7 @@ function makePreviewUrlService() {
     noop, // boxActivityService
     noop, // jobRepository
     noop, // jobService
+    noop, // commerceAdmission
   )
   jest.spyOn(service, 'findOneByIdOrName').mockResolvedValue({
     id: 'MixedCaseBox',
@@ -273,6 +275,7 @@ function makeNetworkTunnelService() {
     noop,
     noop, // jobRepository
     noop, // jobService
+    noop, // commerceAdmission
   )
   jest.spyOn(service, 'findOneByIdOrName').mockResolvedValue({
     id: 'MixedCaseBox',
@@ -306,15 +309,23 @@ describe('BoxService public defaults', () => {
         release: jest.fn().mockResolvedValue(undefined),
       }),
     }
+    const organizationUsageService = {
+      validateOrganizationQuotas: jest.fn().mockResolvedValue({ cpu: 0, memory: 0, disk: 0, gpu: 0, count: 0 }),
+      rollbackPendingUsage: jest.fn().mockResolvedValue(undefined),
+    }
+    const commerceAdmission = {
+      admitCreateBox: jest.fn().mockResolvedValue(null),
+      release: jest.fn().mockResolvedValue(undefined),
+    }
+    const volumeService = { validateVolumes: jest.fn().mockResolvedValue(undefined) }
     const service = Object.create(BoxService.prototype) as BoxService
     Object.assign(service as any, {
       getValidatedOrDefaultRegion: jest.fn().mockResolvedValue({ id: 'region-1' }),
       getValidatedOrDefaultClass: jest.fn().mockReturnValue('small'),
       organizationService: { assertOrganizationIsNotSuspended: jest.fn() },
-      organizationUsageService: {
-        validateOrganizationQuotas: jest.fn().mockResolvedValue({ cpu: 0, memory: 0, disk: 0, gpu: 0, count: 0 }),
-        rollbackPendingUsage: jest.fn().mockResolvedValue(undefined),
-      },
+      organizationUsageService,
+      commerceAdmission,
+      volumeService,
       redis: { exists: jest.fn().mockResolvedValue(1) },
       warmPoolService,
       runnerService,
@@ -323,8 +334,75 @@ describe('BoxService public defaults', () => {
       eventEmitter: { emitAsync: jest.fn().mockResolvedValue(undefined) },
       toBoxDto: jest.fn((box) => box),
     })
-    return { service, boxRepository, runnerService, redisLockProvider, warmPoolService }
+    return {
+      service,
+      boxRepository,
+      runnerService,
+      redisLockProvider,
+      organizationUsageService,
+      commerceAdmission,
+      volumeService,
+      warmPoolService,
+    }
   }
+
+  it('checks Commerce with resolved resources before taking a local quota reservation', async () => {
+    const { service, commerceAdmission, organizationUsageService } = makeCreateService()
+
+    await service.create({ name: 'admitted-box' } as any, { id: 'org-1' } as any)
+
+    expect(commerceAdmission.admitCreateBox).toHaveBeenCalledWith('org-1', { cpu: 1, gpu: 0, mem: 1, disk: 10 })
+    expect(commerceAdmission.admitCreateBox.mock.invocationCallOrder[0]).toBeLessThan(
+      organizationUsageService.validateOrganizationQuotas.mock.invocationCallOrder[0],
+    )
+  })
+
+  it('releases Commerce admission when a later local create step fails', async () => {
+    const { service, commerceAdmission, organizationUsageService } = makeCreateService()
+    const reservation = { organizationId: 'org-1', reservationId: '550e8400-e29b-41d4-a716-446655440000' }
+    commerceAdmission.admitCreateBox.mockResolvedValue(reservation)
+    organizationUsageService.validateOrganizationQuotas.mockRejectedValue(new BadRequestException('quota exceeded'))
+
+    await expect(service.create({ name: 'rejected-box' } as any, { id: 'org-1' } as any)).rejects.toThrow(
+      'quota exceeded',
+    )
+    expect(commerceAdmission.release).toHaveBeenCalledWith(reservation)
+  })
+
+  it('rejects invalid volumes before calling Commerce', async () => {
+    const { service, commerceAdmission, volumeService } = makeCreateService()
+    volumeService.validateVolumes.mockRejectedValue(new BadRequestException('volume is not ready'))
+
+    await expect(
+      service.create(
+        { name: 'invalid-volume-box', volumes: [{ volumeId: 'volume-1', mountPath: '/data' }] } as any,
+        { id: 'org-1' } as any,
+      ),
+    ).rejects.toThrow('volume is not ready')
+    expect(commerceAdmission.admitCreateBox).not.toHaveBeenCalled()
+  })
+
+  it('does not release Commerce admission after the box insert has committed', async () => {
+    const { service, commerceAdmission } = makeCreateService()
+    const reservation = { organizationId: 'org-1', reservationId: '550e8400-e29b-41d4-a716-446655440000' }
+    commerceAdmission.admitCreateBox.mockResolvedValue(reservation)
+    ;(service as any).toBoxDto = jest.fn().mockRejectedValue(new Error('response mapping failed'))
+
+    await expect(service.create({ name: 'committed-box' } as any, { id: 'org-1' } as any)).rejects.toThrow(
+      'response mapping failed',
+    )
+    expect(commerceAdmission.release).not.toHaveBeenCalled()
+  })
+
+  it('propagates a cached 402 without touching local quota state', async () => {
+    const { service, commerceAdmission, organizationUsageService } = makeCreateService()
+    commerceAdmission.admitCreateBox.mockRejectedValue(new HttpException('INSUFFICIENT_AVAILABLE_CREDIT', 402))
+
+    await expect(service.create({ name: 'unfunded-box' } as any, { id: 'org-1' } as any)).rejects.toMatchObject({
+      status: 402,
+    })
+    expect(organizationUsageService.validateOrganizationQuotas).not.toHaveBeenCalled()
+  })
 
   it.each([
     [{ networkBlockAll: true }, { boxLimitedNetworkEgress: false }, { networkBlockAll: true }],

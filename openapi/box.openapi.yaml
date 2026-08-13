@@ -295,10 +295,44 @@ paths:
                 $ref: "#/components/schemas/Box"
         "400":
           $ref: "#/components/responses/BadRequestError"
+        "402":
+          description: Organization credit is insufficient to create the box
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [statusCode, message, error]
+                properties:
+                  statusCode:
+                    type: integer
+                    const: 402
+                  message:
+                    type: string
+                    const: INSUFFICIENT_AVAILABLE_CREDIT
+                  error:
+                    type: string
+                    const: Payment Required
         "409":
           $ref: "#/components/responses/ConflictError"
         "422":
           $ref: "#/components/responses/UnprocessableEntityError"
+        "503":
+          description: Commerce cannot make a safe admission decision from a stale usage snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [statusCode, message, error]
+                properties:
+                  statusCode:
+                    type: integer
+                    const: 503
+                  message:
+                    type: string
+                    const: STALE_USAGE_SNAPSHOT
+                  error:
+                    type: string
+                    const: Service Unavailable
 
     get:
       operationId: listBoxes

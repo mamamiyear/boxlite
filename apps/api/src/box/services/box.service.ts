@@ -85,6 +85,10 @@ import {
   DEFAULT_AUTO_STOP_SECONDS,
   DEFAULT_AUTO_RESUME,
 } from '../constants/box-lifecycle.constants'
+import {
+  CommerceAdmissionReservation,
+  CommerceAdmissionService,
+} from '../../commerce-admission/commerce-admission.service'
 
 // TODO(image-rewrite): resource defaults previously came from the removed image subsystem;
 // these mirror the Box entity column defaults until image resolution is rebuilt.
@@ -118,6 +122,7 @@ export class BoxService {
     @InjectRepository(Job)
     private readonly jobRepository: Repository<Job>,
     private readonly jobService: JobService,
+    private readonly commerceAdmission: CommerceAdmissionService,
   ) {}
 
   protected getLockKey(id: string): string {
@@ -206,6 +211,7 @@ export class BoxService {
     // Released on the failure path; on success the box's CREATED/STATE_UPDATED event
     // realizes the reservation into current usage.
     let quotaReservation: PendingBoxReservation | null = null
+    let commerceReservation: CommerceAdmissionReservation | null = null
 
     try {
       const boxClass = this.getValidatedOrDefaultClass(createBoxDto.class)
@@ -230,6 +236,20 @@ export class BoxService {
 
       this.organizationService.assertOrganizationIsNotSuspended(organization)
 
+      if (createBoxDto.volumes && createBoxDto.volumes.length > 0) {
+        await this.volumeService.validateVolumes(
+          organization.id,
+          createBoxDto.volumes.map((volume) => volume.volumeId),
+        )
+      }
+
+      commerceReservation = await this.commerceAdmission.admitCreateBox(organization.id, {
+        cpu,
+        gpu,
+        mem,
+        disk,
+      })
+
       quotaReservation = await this.organizationUsageService.validateOrganizationQuotas(
         organization,
         cpu,
@@ -238,10 +258,11 @@ export class BoxService {
         gpu,
       )
 
-      if (createBoxDto.volumes && createBoxDto.volumes.length > 0) {
-        const volumeIdOrNames = createBoxDto.volumes.map((v) => v.volumeId)
-        await this.volumeService.validateVolumes(organization.id, volumeIdOrNames)
-      } else if (image && !requiresFreshBoxForNetworkPolicy) {
+      if (
+        (!createBoxDto.volumes || createBoxDto.volumes.length === 0) &&
+        image &&
+        !requiresFreshBoxForNetworkPolicy
+      ) {
         //  No volumes requested — try to claim a pre-warmed box matching this image/spec
         //  before creating a fresh one.
         const skipWarmPool = (await this.redis.exists(`warm-pool:skip:${image}`)) === 1
@@ -261,7 +282,9 @@ export class BoxService {
           })
 
           if (warmPoolBox) {
-            return await this.assignWarmPoolBox(warmPoolBox, createBoxDto, organization)
+            return await this.assignWarmPoolBox(warmPoolBox, createBoxDto, organization, () => {
+              commerceReservation = null
+            })
           }
         }
       }
@@ -324,6 +347,9 @@ export class BoxService {
                 return this.boxRepository.insert(box)
               }),
       )
+      // The box now exists and will produce usage even if response mapping or
+      // event dispatch fails; the Commerce reservation must bridge that usage.
+      commerceReservation = null
 
       this.eventEmitter
         .emitAsync(BoxEvents.CREATED, new BoxCreatedEvent(insertedBox))
@@ -331,6 +357,9 @@ export class BoxService {
 
       return this.toBoxDto(insertedBox)
     } catch (error) {
+      if (commerceReservation) {
+        await this.commerceAdmission.release(commerceReservation)
+      }
       if (quotaReservation) {
         await this.organizationUsageService.rollbackPendingUsage(organization.id, quotaReservation)
       }
@@ -351,6 +380,7 @@ export class BoxService {
     warmPoolBox: Box,
     createBoxDto: CreateBoxDto,
     organization: Organization,
+    onCommitted?: () => void,
   ): Promise<BoxDto> {
     const now = new Date()
     const updateData: Partial<Box> = {
@@ -394,6 +424,7 @@ export class BoxService {
       : await persistWithGeneratedBoxName(warmPoolBox.id, (name) =>
           this.boxRepository.update(warmPoolBox.id, { updateData: { ...updateData, name } }),
         )
+    onCommitted?.()
 
     // Defensive invalidation of orgId cache since the box moved from unassigned to a real organization
     this.boxLookupCacheInvalidationService.invalidateOrgId({

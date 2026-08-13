@@ -20,6 +20,14 @@ const stackSource = [
 ].join('\n')
 const source = `${entrypointSource}\n${stackSource}`
 const environmentExample = readFileSync(new URL('../.env.example', import.meta.url), 'utf8')
+const apiConfigurationSource = liveText(
+  'script',
+  readFileSync(new URL('../../api/src/config/configuration.ts', import.meta.url), 'utf8'),
+)
+const commerceAdmissionSource = liveText(
+  'script',
+  readFileSync(new URL('../../api/src/commerce-admission/commerce-admission.service.ts', import.meta.url), 'utf8'),
+)
 const readme = [
   readFileSync(new URL('../README.md', import.meta.url), 'utf8'),
   readFileSync(new URL('../docs/deployment.md', import.meta.url), 'utf8'),
@@ -543,4 +551,19 @@ test('usage is exported to the ingest origin, never to the dashboard billing URL
   assert.match(environmentExample, /^# USAGE_EXPORT_URL=/m)
   assert.match(environmentExample, /boxlite-commerce\/<stage>\/usage-ingest-token/)
   assert.doesNotMatch(environmentExample, /^USAGE_EXPORT_TOKEN=/m)
+})
+
+test('threads the Commerce admission timeout from stage config to the HTTP client', () => {
+  assert.match(
+    liveConfig,
+    /COMMERCE_ADMISSION_TIMEOUT_MS: envOr\('COMMERCE_ADMISSION_TIMEOUT_MS', '500'\)/,
+  )
+  assert.match(
+    apiConfigurationSource,
+    /requiredCount\(env\.COMMERCE_ADMISSION_TIMEOUT_MS, 500, 'COMMERCE_ADMISSION_TIMEOUT_MS'\)/,
+  )
+  assert.match(apiConfigurationSource, /commerceAdmission:\s*commerceAdmissionConfig\(\)/)
+  assert.match(commerceAdmissionSource, /const settings = this\.config\.get\('commerceAdmission'\)/)
+  assert.equal(commerceAdmissionSource.match(/timeout: settings\.timeoutMs/g)?.length, 2)
+  assert.match(environmentExample, /^# COMMERCE_ADMISSION_TIMEOUT_MS=500$/m)
 })
